@@ -1,0 +1,34 @@
+# dependencies
+node_modules/
+client/node_modules/
+
+# build outputs
+client/dist/
+dist/
+
+# env / secrets
+.env
+.env.local
+.env.*.local
+
+# user uploads (runtime)
+server/uploads/
+uploads/
+
+# test output images
+test-*.png
+test-*.jpg
+e2e-test-result.png
+
+# large binary assets (cutout PNGs ~50MB, keep room-backgrounds ~2.6MB)
+assets/products/
+assets/products-cutout/
+
+# editor / os
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.claude/
+*.log
+npm-debug.log*

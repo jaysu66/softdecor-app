@@ -1,0 +1,20 @@
+{
+  "name": "softdecor-app",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "server": "npx tsx --env-file=.env server/index.ts",
+    "client": "cd client && npx vite --host",
+    "dev": "concurrently \"npm run server\" \"npm run client\""
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.19.12",
+    "@types/multer": "^2.1.0",
+    "concurrently": "^9.2.1",
+    "hono": "^4.12.10",
+    "liblibai": "^0.0.11",
+    "multer": "^2.1.1",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.2"
+  }
+}
