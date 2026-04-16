@@ -28,6 +28,224 @@ upload → analyzing → analysis → recommending → recommend → canvas → 
 
 ---
 
+## 产品逻辑深度梳理
+
+下面按前端组件 → 后端路由 → AI 调用链的顺序，梳理每一步的代码逻辑和数据流转。
+
+### Step 1：上传（UploadPanel → 无后端）
+
+```
+用户选图 / 拖拽 / 选测试背景图
+  ↓
+compressImage()  前端 Canvas 压缩（>500KB 才压，maxDim=1800, quality=0.88）
+  ↓
+再压一次缩略图（maxDim=800, quality=0.75）→ 存为 base64，写入 Zustand
+  ↓
+store.uploadedImageBase64 = "data:image/jpeg;base64,..."  （后续所有 AI 调用都用这个）
+store.uploadedImage = objectURL（仅前端预览用）
+```
+
+**要点**：图片从不上传到后端文件系统，全程 base64 in-memory 传递。
+
+### Step 2：AI 分析（AnalysisResult → POST /api/analyze）
+
+```
+前端发送 { imageBase64 }
+  ↓
+后端 analyze.ts:
+  ↓
+fetch(LLM_BASE_URL) → LLM_VISION_MODEL（带 image_url）
+  prompt = "你是专业室内设计师，分析这张房间照片，返回JSON"
+  ↓
+LLM 返回 JSON → 正则提取 {} → 解析
+  ↓ 失败则走 fallback（更简短的 prompt 重试一次）
+返回 { success, analysis }
+```
+
+**analysis 结构**：
+```json
+{
+  "room_type": "客厅",
+  "style": "北欧",
+  "secondary_styles": ["现代简约", "日式"],
+  "lighting": "明亮",
+  "color_tone": "暖色调",
+  "existing_furniture": ["沙发", "电视柜"],
+  "suggested_categories": ["茶几", "地毯", "落地灯"],
+  "space_features": "空间开阔，落地窗采光好",
+  "suggestions": "建议搭配浅色系地毯和绿植"
+}
+```
+
+### Step 3：智能推荐（SchemeSelector → POST /api/recommend）
+
+```
+前端发送 { analysis }
+  ↓
+后端 recommend.ts:
+  ↓ 加载 products.json（30 SKU）+ uploaded_urls.json
+  ↓
+对每个商品打分 scoreProduct():
+  风格完全匹配 → +30分
+  风格兼容（STYLE_COMPAT映射表）→ +10~20分
+  品类匹配（analysis.suggested_categories）→ +25分
+  空间匹配（product.space 包含 room_type）→ +15分
+  关联推荐（已有家具出现在 product.related）→ +5分
+  ↓
+按分数排序，生成两个方案：
+  方案A "精选搭配"：Top 7，每品类最多2个
+  方案B "混搭风格"：排除方案A的SKU，Top 6
+  ↓
+返回 { success, schemes: [schemeA, schemeB] }
+```
+
+**注意**：推荐是纯规则算法（不调 AI），在后端 <1ms 完成。
+
+### Step 4a：场景合成（CanvasEditor → POST /api/compose）
+
+这是**核心功能**，链路最长：
+
+```
+前端发送 { roomImageBase64, selectedProducts, analysis }
+  ↓
+后端 compose.ts:
+  ↓
+构建 image_urls 数组:
+  [0] = 房间照片 base64（data:image/jpeg;base64,...）
+  [1] = 商品1 抠图 URL（https://iili.io/xxx.png）
+  [2] = 商品2 抠图 URL
+  ...最多 [9]（Seedream 上限 10 张）
+  ↓ 如果没有可用的商品 http URL → 走单图 fallback
+  
+── Step 4a-1: LLM 生成 prompt ──
+  ↓
+fetch(LLM_BASE_URL) → LLM_VISION_MODEL
+  给 LLM 看房间照片 + 文字描述每件商品
+  要求写 Seedream prompt，用"第N张图"引用每件商品
+  ↓
+LLM 返回 prompt（~250字），例如：
+  "保持第1张图的客厅建筑结构不变。将第2张图的北欧灰色沙发放在正中央，
+   第3张图的大理石茶几置于沙发前方，第4张图的羊毛地毯铺在茶几下方..."
+  ↓
+── Step 4a-2: Seedream 5.0 生图 ──
+  ↓
+fetch(ARK_ENDPOINT) → doubao-seedream-5-0-260128
+  {
+    prompt: LLM写的prompt,
+    image_url: 房间base64（img2img锚点，锁住房间结构）,
+    image_urls: [房间, 商品1, 商品2, ...]（多图参考）,
+    strength: 0.30,
+    size: "1920x1920",
+    response_format: "b64_json"
+  }
+  ↓ 失败则自动降级 → singleImageCompose()
+  ↓   只用 image_url（房间）+ 纯文本prompt，strength=0.40
+  
+返回 { composedImage: "data:image/png;base64,...", scenePrompt, mode }
+```
+
+**降级链**：多图合成失败 → 单图合成 → 报错
+
+### Step 4b：对话微调（CanvasEditor 聊天框 → POST /api/compose/adjust）
+
+```
+前端发送 { previousPrompt, userFeedback, selectedProducts, analysis }
+  ↓
+后端 compose.ts (/compose/adjust):
+  ↓
+── LLM 修改 prompt ──
+  "之前的prompt是: '...'  用户要求: '沙发换深色'  请更新prompt"
+  ↓
+LLM 返回新 prompt（保留"第N张图"引用）
+  ↓
+── Seedream 重新生成 ──
+  重建 image_urls 数组（房间 + 商品抠图 URL）
+  多图模式: strength=0.35（比首次稍高）
+  单图模式: strength=0.45
+  ↓
+返回新的 composedImage + newPrompt
+```
+
+**关键**：每次微调都重新生成整张图，不是局部编辑。prompt 累积修改。
+
+### Step 4c：画布 Agent（预留，POST /api/agent-adjust）
+
+```
+前端发送 { message, canvasState, selectedSkus, availableProducts, canvasSize }
+  ↓
+后端 agent.ts:
+  ↓
+fetch(LLM_BASE_URL) → LLM_AGENT_MODEL + tools 定义
+  5个工具: move_product / resize_product / rotate_product / remove_product / add_product
+  ↓
+LLM 返回 tool_calls → 解析为 actions 数组
+  ↓ 如果模型不支持 tool calling → fallbackJson() 让 LLM 直接输出 JSON
+  
+返回 { reply, actions: [{type:"move", sku:"SF-001", x:30, y:60}, ...] }
+```
+
+**注意**：Agent 目前只返回指令，前端的 Fabric.js 画布还没接上执行逻辑（预留功能）。
+
+### Step 5：精修（RefinePanel → POST /api/refine）
+
+```
+前端发送 { canvasImage（base64）, prompt }
+  ↓
+后端 refine.ts:
+  ↓
+── 主路径: Seedream 3.0 精修 ──
+  fetch(ARK_BASE/images/generations) → seedream-3.0
+  { image: base64, prompt: "精修为真实照片效果", strength: 0.35, size: "1024x1024" }
+  ↓ 成功 → 返回 { mode: "refined", refinedImage }
+  
+── 回退: LLM 评分反馈 ──
+  ↓ Seedream 3.0 失败时
+  fetch(LLM_BASE_URL) → LLM_VISION_MODEL
+  让 LLM 看合成图，输出评分+建议 JSON
+  ↓ 返回 { mode: "feedback", feedback: {score, suggestions, ...}, originalImage }
+  
+── 最终回退 ──
+  ↓ LLM 也失败
+  返回 { mode: "original", originalImage, message: "精修服务暂不可用" }
+```
+
+**三层降级**：Seedream 3.0 精修 → LLM 评分反馈 → 原图直出
+
+### 前端状态机总览
+
+```
+upload ──点击"AI分析"──→ analyzing ──LLM返回──→ analysis
+                                                    │
+                              点击"获取推荐方案" ◄────┘
+                                    │
+                                    ▼
+                              recommending ──算法返回──→ recommend
+                                                          │
+                                        点击"进入场景编辑" ◄──┘
+                                                │
+                                                ▼
+                                             canvas ←─── 聊天微调循环
+                                                │
+                                       点击"AI精修" │
+                                                ▼
+                                            refining ──API返回──→ result
+                                                                    │
+                                                 "返回编辑" ← ──────┘
+                                                 "重新开始" → upload
+```
+
+### 数据在各步骤间的流转
+
+| 步骤 | 写入 Store | 读取 Store | 调用后端 |
+|------|-----------|-----------|---------|
+| Upload | uploadedImage, uploadedImageBase64 | — | — |
+| Analyze | analysis | uploadedImageBase64 | POST /api/analyze |
+| Recommend | schemes | analysis | POST /api/recommend |
+| Canvas | — (composedImage 在组件 state) | uploadedImageBase64, selectedProducts, analysis | POST /api/compose, /compose/adjust |
+| Refine | refineResult | — (从 canvas 传入) | POST /api/refine |
+
+---
+
 ## 快速开始
 
 ### 1. 克隆仓库
